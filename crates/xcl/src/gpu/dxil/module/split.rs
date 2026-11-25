@@ -550,8 +550,12 @@ impl Module {
                 cost += components[i].0;
                 i += 1;
             }
-            if cost > limit { return None; }
-            if used + cost > limit {
+            // A loop or joined spin region cannot cross a dispatch boundary.
+            // Give a bounded oversized region its own piece.
+            if cost > limit.saturating_mul(4) {
+                return None;
+            }
+            if used != 0 && used + cost > limit {
                 blocks.push(Vec::new());
                 used = 0;
             }
@@ -560,6 +564,8 @@ impl Module {
                 for &b in component { stages[b] = blocks.len() - 1; }
             }
         }
+
+        if blocks.len() == 1 { return None; }
 
         let mut crossing = BTreeSet::new();
         for &b in &order {
@@ -628,7 +634,55 @@ mod tests {
         recomp::{runner, CsInterface},
     };
 
-    fn compare(threads: u32) {
+    #[test]
+    fn oversized_loop_occupies_one_piece_up_to_the_hard_ceiling() {
+        use super::{Block, Module};
+
+        let mut m = Module::new();
+        let entry = m.entry_block();
+        let header = m.new_block();
+        let body = m.new_block();
+        let exit = m.new_block();
+        let word = m.i32();
+        let zero = m.i32c(0);
+        let one = m.i32c(1);
+        m.br(header);
+        m.set_block(header);
+        let count = m.phi(word);
+        m.add_incoming(count, zero, entry);
+        let more = m.cmp(Pred::ULt, count, one);
+        m.cond_br(more, body, exit);
+        m.set_block(body);
+        let mut next = count;
+        for _ in 0..12 { next = m.bin(BinOp::Add, next, one); }
+        m.add_incoming(count, next, body);
+        m.br(header);
+        m.set_block(exit);
+        m.ret();
+
+        // Header (3) + body (13) is exactly four times a target of 4.
+        let plan = m.dispatch_plan(4).expect("keep the loop in its own piece");
+        assert_eq!(plan.blocks, [vec![entry], vec![header, body], vec![exit]]);
+        assert!(m.dispatch_plan(3).is_none());
+
+        // An oversized first block must not create an empty leading piece.
+        // If the program fits wholly in this one component, splitting has no benefit.
+        let mut m = Module::new();
+        let one = m.i32c(1);
+        for _ in 0..4 { m.bin(BinOp::Add, one, one); }
+        let end = m.new_block();
+        m.br(end);
+        m.set_block(end);
+        m.ret();
+        assert_eq!(m.dispatch_plan(4).unwrap().blocks, [vec![Block(0)], vec![end]]);
+        let mut m = Module::new();
+        let one = m.i32c(1);
+        for _ in 0..4 { m.bin(BinOp::Add, one, one); }
+        m.ret();
+        assert!(m.dispatch_plan(4).is_none());
+    }
+
+    fn compare(threads: u32, extra_adds: u32) {
         if !runner::wave32_supported().unwrap_or(false) {
             runner::skip_test("no wave32 GPU");
             return;
@@ -662,6 +716,7 @@ mod tests {
 
         // Each loop both consumes the previous loop's result and reuses
         // the original per-lane input. All lanes eventually reconverge.
+        let mut large_loop = None;
         for round in 1..=16 {
             let pred = lw.cur();
             let body = lw.s.m.new_block();
@@ -675,6 +730,10 @@ mod tests {
             let next = lw.addc(counter, 1);
             value = lw.add(acc, original);
             value = lw.addc(value, round);
+            if round == 8 {
+                for _ in 0..extra_adds { value = lw.add(value, original); }
+                if extra_adds > 0 { large_loop = Some(body); }
+            }
             lw.s.m.add_incoming(counter, next, body);
             lw.s.m.add_incoming(acc, value, body);
             let again = lw.cmp(Pred::ULt, next, trips);
@@ -693,6 +752,12 @@ mod tests {
         lw.s.raw_store(mem, offset, &[value]);
         lw.s.m.ret();
         lw.s.m.optimize();
+        if let Some(oversized) = large_loop {
+            let n = lw.s.m.block_insts(oversized).len();
+            assert!(n > 40 && n <= 160);
+            let plan = lw.s.m.dispatch_plan(40).expect("partition around oversized loop");
+            assert!(plan.blocks.iter().any(|piece| piece == &[oversized]));
+        }
         let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
@@ -701,7 +766,7 @@ mod tests {
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;
-            v + n * (16 * v + 136) + u32::from(split && i as u32 % threads < 32) + (v ^ (i as u32 % threads))
+            v + n * ((16 + extra_adds) * v + 136) + u32::from(split && i as u32 % threads < 32) + (v ^ (i as u32 % threads))
         }).collect();
         let reference = runner::dispatch(&whole, [3, 1, 1], &[], &initial).unwrap();
         assert_eq!(reference, expected);
@@ -894,11 +959,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_chain_wave32_live_loops() { compare(32); }
+    fn dispatch_chain_wave32_live_loops() { compare(32, 0); }
 
     /// A guest wave64 split across two hardware wave32s.
     #[test]
-    fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64); }
+    fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64, 0); }
+    #[test]
+    fn dispatch_chain_oversized_loop_matches_whole() {
+        compare(32, 48);
+        compare(64, 48);
+    }
+
     /// Early exits and forward skips retain their own continuation tags; group
     /// indexing must keep every lane separate across all three dispatch axes.
     #[test]
