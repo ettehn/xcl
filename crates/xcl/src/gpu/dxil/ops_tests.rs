@@ -984,6 +984,37 @@ fn int64_bit_ops_match_cpu() {
 }
 
 #[test]
+fn i1_to_i64_sign_extension_and_shift_match_cpu() {
+    let mut k = kernel();
+    let input = k.input(0);
+    let i1 = k.s.m.i1();
+    let i32 = k.s.m.i32();
+    let i64 = k.s.m.i64();
+    let bit = k.s.m.cast(CastOp::Trunc, input, i1);
+    let value = k.s.m.cast(CastOp::SExt, bit, i64);
+    let shift_mask = k.s.m.const_int(i64, 63);
+    let shift = k.s.m.bin(BinOp::And, value, shift_mask);
+    let shifted = k.s.m.bin(BinOp::AShr, value, shift);
+    let thirty_two = k.s.m.const_int(i64, 32);
+    for (slot, word) in [value, shifted].into_iter().enumerate() {
+        let low = k.s.m.cast(CastOp::Trunc, word, i32);
+        let high = k.s.m.bin(BinOp::LShr, word, thirty_two);
+        let high = k.s.m.cast(CastOp::Trunc, high, i32);
+        k.out((slot * 2) as u32, low);
+        k.out((slot * 2 + 1) as u32, high);
+    }
+    let c = k.finish([32, 1, 1]);
+    let inputs: Vec<u32> = (0..32).collect();
+    let Some(r) = gpu(&c, &mem_of(&[inputs]), &[], &[]) else { return };
+    for lane in 0..32 {
+        let expected = if lane & 1 == 1 { u32::MAX } else { 0 };
+        for slot in 0..4 {
+            assert_eq!(outv(&r, slot)[lane], expected, "i1 sign extension output {slot}, lane {lane}");
+        }
+    }
+}
+
+#[test]
 fn uav_array_3d_stores_loads_and_texture_atomics_run() {
     // u: heap 3 = RWTexture2DArray<uint> 4×4×2, heap 5 = RWTexture3D<float> 4×4×2.
     let mut k = kernel();

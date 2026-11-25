@@ -589,6 +589,12 @@ impl Module {
         self.push(Op::Bin(op, a, b, flags), t)
     }
     pub fn cast(&mut self, op: CastOp, v: Value, to: Ty) -> Value {
+        if op == CastOp::SExt && self.type_of(v) == self.i1() && to == self.i64() {
+            // Direct i1 -> i64 sign extension loses the high word on the RX 6800M.
+            let i32 = self.i32();
+            let intermediate = self.cast(CastOp::SExt, v, i32);
+            return self.cast(CastOp::SExt, intermediate, to);
+        }
         self.push(Op::Cast(op, v, to), to)
     }
     pub fn bitcast(&mut self, v: Value, to: Ty) -> Value {
