@@ -2,7 +2,7 @@
 //! jump back to an earlier dispatch, so a strongly connected component is
 //! indivisible. Each crossing edge has its own compact state layout.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::{BinOp, Block, CastOp, Module, Op, TypeDef, Value};
 use crate::gpu::dxil::shader::{Feature, RawUav, Shader};
@@ -160,13 +160,17 @@ impl Shader {
             if exchange != 0 { return None; }
         }
         let plan = self.m.dispatch_plan(limit)?;
-        let mut stride = 1;
-        for edge in &plan.edges {
-            let mut words = 1;
-            for &v in &edge.live {
-                words += self.m.transport_words(v)?;
+        // Slot zero is the tag. Every transported SSA value owns its payload slots
+        // until the chain finishes. An outgoing store can never overwrite a value
+        // restored by the same piece, even when the restore is sunk past a branch.
+        let mut stride = 1u32;
+        let mut slots = BTreeMap::new();
+        for value in plan.edges.iter().flat_map(|e| e.live.iter().copied()).collect::<BTreeSet<_>>() {
+            let words = self.m.transport_words(value)?;
+            if words != 0 {
+                slots.insert(value, stride);
+                stride = stride.checked_add(words)?;
             }
-            stride = stride.max(words);
         }
         let mut shared = Vec::new();
         if multi {
@@ -176,11 +180,13 @@ impl Shader {
                 stride = stride.checked_add(u32::try_from(n).ok()?.div_ceil(lanes))?;
             }
         }
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, threads, &prefix, &shared)).collect::<Option<Vec<_>>>()?;
-        Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(lanes)? })
+        let dwords_per_group = stride.checked_mul(lanes)?;
+        dwords_per_group.checked_mul(4)?;
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix, &shared)).collect::<Option<Vec<_>>>()?;
+        Some(DispatchChain { pieces, dwords_per_group })
     }
 
-    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, threads: [u32; 3], prefix: &[u32], shared: &[(Value, u32, u32)]) -> Option<Vec<u8>> {
+    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32], shared: &[(Value, u32, u32)]) -> Option<Vec<u8>> {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
@@ -201,10 +207,8 @@ impl Shader {
         let mut hops = HashMap::new();
         let mut exits = HashMap::new();
         let mut cases = Vec::new();
-        let mut paths = Vec::new();
-        let mut incoming = std::collections::BTreeMap::<Value, Vec<(Vec<Value>, Block)>>::new();
-        let mut statics = BTreeSet::new();
-        let merge = dst.m.new_block();
+        let mut deferred = BTreeMap::new();
+        let mut incoming = BTreeSet::new();
         let done = dst.m.new_block();
         let selector = if stage != 0 { Some(dst.raw_load(scratch.uav, scratch.base, 1)[0]) } else { None };
         for (index, edge) in plan.edges.iter().enumerate() {
@@ -213,57 +217,27 @@ impl Shader {
                 exits.insert((edge.from, edge.to), (dst.m.new_block(), tag));
             }
             if let Some(&target) = local.get(&edge.to) {
-                let bridge = dst.m.new_block();
-                dst.m.set_block(bridge);
-                let mut slot = 1;
-                for &v in &edge.live {
-                    let n = src.transport_words(v)?;
-                    if n == 0 {
-                        statics.insert(v);
-                        continue;
-                    }
-                    let words = (slot..slot + n).map(|word| {
-                        let at = scratch.at(&mut dst.m, word);
-                        dst.raw_load(scratch.uav, at, 1)[0]
-                    }).collect();
-                    incoming.entry(v).or_default().push((words, bridge));
-                    slot += n;
-                }
-                dst.m.br(merge);
+                incoming.extend(edge.live.iter().copied());
                 let hop = dst.m.new_block();
                 dst.m.set_block(hop);
                 dst.m.br(target);
-                cases.push((tag, bridge));
-                paths.push((bridge, tag, hop));
+                cases.push((tag, hop));
                 hops.insert((edge.from, edge.to), hop);
             }
         }
         dst.m.set_block(dispatch_entry);
         if let Some(sel) = selector {
-            dst.m.switch(sel, done, &cases);
-            dst.m.set_block(merge);
-            let word = dst.m.i32();
-            let mut unpack = Vec::new();
-            for (original, inc) in incoming {
-                let mut words = Vec::new();
-                for k in 0..inc[0].0.len() {
-                    let phi = dst.m.phi(word);
-                    for &(pred, _, _) in &paths {
-                        let v = inc.iter().find(|p| p.1 == pred).map(|p| p.0[k]).unwrap_or_else(|| dst.m.undef(word));
-                        dst.m.add_incoming(phi, v, pred);
-                    }
-                    words.push(phi);
+            for v in incoming {
+                if values.contains_key(&v) { continue; }
+                if slots.contains_key(&v) {
+                    let id = dst.m.detached_phi(src.insts[inst(v)?].ty);
+                    deferred.insert(id, v);
+                    values.insert(v, id);
+                } else {
+                    src.rebuild_static(v, &mut dst.m, &mut values)?;
                 }
-                unpack.push((original, words));
             }
-            for (original, words) in unpack {
-                values.insert(original, src.unpack(original, &words, &mut dst.m));
-            }
-            for handle in statics {
-                src.rebuild_static(handle, &mut dst.m, &mut values)?;
-            }
-            let routes: Vec<_> = paths.iter().map(|&(_, tag, hop)| (tag, hop)).collect();
-            dst.m.switch(sel, done, &routes);
+            dst.m.switch(sel, done, &cases);
         } else {
             dst.m.br(local[&Block(0)]);
         }
@@ -315,21 +289,23 @@ impl Shader {
         for edge in &plan.edges {
             let Some(&(b, tag)) = exits.get(&(edge.from, edge.to)) else { continue };
             dst.m.set_block(b);
-            let mut slot = 1;
             for &v in &edge.live {
-                let n = src.transport_words(v)?;
-                if n != 0 {
+                // The defining piece writes a distinct slot. Later pieces can bypass
+                // it or read it without copying it at their own outgoing edges.
+                if let Some(&slot) = slots.get(&v) {
+                    if !local.contains_key(&src.def_block[inst(v)?]) { continue; }
                     let words = src.pack(v, *values.get(&v)?, &mut dst.m);
                     for (k, word) in words.into_iter().enumerate() {
                         let at = scratch.at(&mut dst.m, slot + k as u32);
                         dst.raw_store(scratch.uav, at, &[word]);
                     }
-                    slot += n;
                 }
             }
             dst.raw_store(scratch.uav, scratch.base, &[tag]);
             if checkpoint { dst.m.br(done); } else { dst.m.ret(); }
         }
+        src.place_restores(&mut dst, &scratch, slots, &deferred)?;
+        dst.m.sink_cheap_piece_ops();
         dst.infer_piece_features();
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
@@ -363,6 +339,17 @@ impl Shader {
     }
 }
 
+fn common_dominator(mut a: usize, mut b: usize, rank: &[Option<u32>], dom: &[Option<usize>]) -> usize {
+    while a != b {
+        if rank[a] > rank[b] {
+            a = dom[a].unwrap();
+        } else {
+            b = dom[b].unwrap();
+        }
+    }
+    a
+}
+
 fn inst(v: Value) -> Option<usize> {
     if let Value::Inst(i) = v { Some(i as usize) } else { None }
 }
@@ -376,6 +363,128 @@ impl Module {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    // Phi operands are consumed on incoming edges. A forwarding-only input has
+    // no placeholder users, so it requires no load in this piece.
+    fn place_restores(
+        &self,
+        dst: &mut Shader,
+        scratch: &Scratch,
+        slots: &BTreeMap<Value, u32>,
+        deferred: &BTreeMap<Value, Value>,
+    ) -> Option<()> {
+        let (order, rank) = dst.m.block_layout();
+        let dom = dst.m.idoms(&order.iter().map(|&b| b as u32).collect::<Vec<_>>());
+        let mut uses = HashMap::new();
+        for &b in &order {
+            for &id in &dst.m.blocks[b] {
+                let op = &dst.m.insts[id as usize].op;
+                let mut record = |v: Value, p: usize| {
+                    if deferred.contains_key(&v) {
+                        uses.entry(v).and_modify(|d| *d = common_dominator(*d, p, &rank, &dom)).or_insert(p);
+                    }
+                };
+                if let Op::Phi(edges) = op {
+                    for &(v, p) in edges {
+                        record(v, p.0 as usize);
+                    }
+                } else {
+                    op.for_each_operand(|v| record(v, b));
+                }
+            }
+        }
+        let mut replacements = HashMap::new();
+        for (&placeholder, &v) in deferred {
+            let Some(&b) = uses.get(&placeholder) else { continue };
+            dst.m.set_block(Block(b as u32));
+            let terminator = dst.m.blocks[b].pop()?;
+            let previous = dst.m.blocks[b].len();
+            let slot = slots[&v];
+            let words = (slot..slot + self.transport_words(v)?)
+                .map(|k| {
+                    let at = scratch.at(&mut dst.m, k);
+                    dst.raw_load(scratch.uav, at, 1)[0]
+                })
+                .collect::<Vec<_>>();
+            let value = self.unpack(v, &words, &mut dst.m);
+            let added = dst.m.blocks[b].split_off(previous);
+            // In block zero the scratch address is materialized before the switch.
+            // At every other block entry only the leading phis must precede a load.
+            let at = if b == 0 {
+                previous
+            } else {
+                dst.m.blocks[b].iter().take_while(|&&i| matches!(dst.m.insts[i as usize].op, Op::Phi(_))).count()
+            };
+            dst.m.blocks[b].splice(at..at, added);
+            dst.m.blocks[b].push(terminator);
+            replacements.insert(placeholder, value);
+        }
+        dst.m.replace_uses(&replacements);
+        Some(())
+    }
+
+    fn sink_cheap_piece_ops(&mut self) {
+        // Only sink a cheap definition whose nonconstant inputs are already used in
+        // the destination block. Moving it cannot introduce a new live-in there.
+        let (order, _) = self.block_layout();
+        let mut uses: HashMap<Value, BTreeSet<usize>> = HashMap::new();
+        for &b in &order {
+            for &id in &self.blocks[b] {
+                let op = &self.insts[id as usize].op;
+                if let Op::Phi(inc) = op {
+                    for &(v, p) in inc {
+                        uses.entry(v).or_default().insert(p.0 as usize);
+                    }
+                } else {
+                    op.for_each_operand(|v| {
+                        uses.entry(v).or_default().insert(b);
+                    });
+                }
+            }
+        }
+        // Moving a producer and then a consumer based on stale use sets may violate
+        // dominance. Limit this pass to candidates whose consumers stay in place.
+        let eligible = |op: &Op| matches!(op, Op::Cast(CastOp::BitCast | CastOp::Trunc, ..) | Op::Select(..));
+        let mut feeds_candidate = HashSet::new();
+        for def in &self.insts {
+            if eligible(&def.op) {
+                def.op.for_each_operand(|v| {
+                    feeds_candidate.insert(v);
+                });
+            }
+        }
+        for &b in &order {
+            for id in self.blocks[b].clone() {
+                let val = Value::Inst(id);
+                if !eligible(&self.insts[id as usize].op) || feeds_candidate.contains(&val) {
+                    continue;
+                }
+                let Some(sites) = uses.get(&val) else { continue };
+                if sites.len() != 1 {
+                    continue;
+                }
+                let t = *sites.first().unwrap();
+                if t == b {
+                    continue;
+                }
+                let mut shared = true;
+                self.insts[id as usize].op.for_each_operand(|v| {
+                    if let Value::Inst(_) = v {
+                        shared &= uses.get(&v).is_some_and(|vs| vs.contains(&t))
+                            && self.def_block[inst(v).unwrap()].0 as usize != t;
+                    }
+                });
+                if !shared {
+                    continue;
+                }
+                let at =
+                    self.blocks[t].iter().take_while(|&&i| matches!(self.insts[i as usize].op, Op::Phi(_))).count();
+                self.blocks[b].retain(|&i| i != id);
+                self.blocks[t].insert(at, id);
+                self.def_block[id as usize] = Block(t as u32);
+            }
         }
     }
 
@@ -872,6 +981,85 @@ mod tests {
         assert_eq!(result, reference);
     }
 
+    fn check_persistent_payload(reuse_hole: bool) {
+        use super::Value;
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        fn mix(lw: &mut Lw, mut v: Value, seed: u32) -> Value {
+            let multiplier = lw.c(33);
+            for i in 1..=12 {
+                let key = lw.c(seed + i);
+                v = lw.xor(v, key);
+                v = lw.mul(v, multiplier);
+            }
+            v
+        }
+        fn expected_mix(v: u32, seed: u32) -> u32 {
+            (1..=12).fold(v, |x, i| (x ^ (seed + i)).wrapping_mul(33))
+        }
+
+        let geometry = [32, 1, 1];
+        let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        let first = lw.s.raw_load(mem, offset, 1)[0];
+        let saved = mix(&mut lw, first, 10);
+        let middle = lw.s.m.new_block();
+        let last = lw.s.m.new_block();
+        // every lane takes the middle block; the branch only keeps the optimiser from merging it
+        let entry = lw.cur();
+        let width = lw.s.wave_lane_count();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, middle, last);
+        lw.s.m.set_block(middle);
+        let replacement = mix(&mut lw, if reuse_hole { first } else { tid }, 30);
+        lw.s.raw_store(mem, offset, &[replacement]);
+        lw.s.m.br(last);
+        lw.s.m.set_block(last);
+        let i32 = lw.s.m.i32();
+        let arrived = lw.s.m.phi(i32);
+        lw.s.m.add_incoming(arrived, replacement, middle);
+        lw.s.m.add_incoming(arrived, first, entry);
+        let input = if reuse_hole { lw.xor(saved, arrived) } else { saved };
+        let output = mix(&mut lw, input, 50);
+        lw.s.raw_store(mem, offset, &[output]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+
+        let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
+        let plan = lw.s.m.dispatch_plan(limit).unwrap();
+        assert_eq!(plan.blocks.len(), 3);
+        let incoming = plan.edges.iter().find(|edge| edge.to == middle).unwrap();
+        let outgoing = plan.edges.iter().find(|edge| edge.from == middle && edge.to == last).unwrap();
+        assert!(incoming.live.contains(&saved) && outgoing.live.contains(&saved));
+        if reuse_hole {
+            // In compact per-edge order, the replacement occupies saved's old
+            // slot. A delayed load of saved from that slot would get replacement.
+            let slot = |edge: &super::Edge, v| {
+                edge.live.iter().filter(|&&x| lw.s.m.transport_words(x) == Some(1)).position(|&x| x == v).unwrap()
+            };
+            assert_eq!(slot(incoming, saved), slot(outgoing, replacement));
+        }
+
+        let chain = lw.s.split_compute(geometry, None, limit).unwrap();
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        let initial: Vec<u32> = (0..32).map(|i| 1009 * i + 77).collect();
+        let mut expected: Vec<_> = initial.iter().map(|&v| {
+            let saved = expected_mix(v, 10);
+            expected_mix(if reuse_hole { saved ^ expected_mix(v, 30) } else { saved }, 50)
+        }).collect();
+        // The runners read back at least 64 words. Only lanes 0..32 write.
+        expected.resize(64, 0);
+        assert_eq!(runner::dispatch(&whole, [1, 1, 1], &[], &initial).unwrap(), expected);
+        assert_eq!(runner::dispatch_split(&chain, [1, 1, 1], &initial).unwrap(), expected);
+    }
+
     /// A typed UAV load in one piece only: the whole program declares its flag, the other pieces
     /// must not (the validator wants flags to match usage, and a refused piece leaves it whole).
     #[test]
@@ -1055,6 +1243,12 @@ mod tests {
         assert_eq!(result, expected, "split program CPU oracle");
         println!("CHAIN_EXIT checked_words=2048 guards=16 pieces={} scratch_dwords_per_group={}", chain.pieces.len(), chain.dwords_per_group);
     }
+
+    #[test]
+    fn dispatch_chain_payload_skips_middle_piece() { check_persistent_payload(false); }
+
+    #[test]
+    fn dispatch_chain_payload_survives_reused_edge_slot() { check_persistent_payload(true); }
 
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32, 0); }

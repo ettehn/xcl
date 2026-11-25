@@ -295,7 +295,7 @@ impl Module {
 
     /// Immediate dominators of the blocks in `order` (reverse postorder), by
     /// Cooper, Harvey and Kennedy's iteration ("A Simple, Fast Dominance Algorithm").
-    fn idoms(&self, order: &[u32]) -> Vec<Option<usize>> {
+    pub(super) fn idoms(&self, order: &[u32]) -> Vec<Option<usize>> {
         let n = self.blocks.len();
         let mut rpo = vec![usize::MAX; n];
         for (k, &b) in order.iter().enumerate() {
