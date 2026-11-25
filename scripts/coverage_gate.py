@@ -31,6 +31,22 @@ def sweep_json(stdout):
     raise ValueError("no JSON report in the sweep output")
 
 
+def report_error(report):
+    stages = report.get("stages") if isinstance(report, dict) else None
+    if not isinstance(stages, dict) or not stages:
+        return "expected a non-empty 'stages' mapping"
+    for stage, counts in stages.items():
+        if not isinstance(counts, dict):
+            return f"stage {stage!r}: expected a mapping of counters"
+        for key in ("total", "translated", *WORSEN):
+            count = counts.get(key)
+            if type(count) is not int or count < 0:
+                return f"stage {stage!r}: expected a non-negative integer for {key!r}"
+    if not any(counts["total"] for counts in stages.values()):
+        return "no programs in 'stages'"
+    return None
+
+
 def compare(baseline, run):
     """(regressions, notes) of a sweep against the baseline; regressions are (stage, why)."""
     bad, notes = [], []
@@ -69,9 +85,6 @@ def main(argv=None):
         except (json.JSONDecodeError, OSError) as e:
             print(f"error: failed to read run-json '{args.run_json}': {e}", file=sys.stderr)
             return 2
-        if not isinstance(run, dict) or "stages" not in run or not isinstance(run["stages"], dict):
-            print(f"error: invalid run-json '{args.run_json}': missing 'stages' mapping", file=sys.stderr)
-            return 2
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
@@ -94,6 +107,10 @@ def main(argv=None):
         except ValueError as e:
             print(f"{e}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}", file=sys.stderr)
             return 2
+    if error := report_error(run):
+        source = f"run-json '{args.run_json}'" if args.run_json else "live sweep report"
+        print(f"error: invalid {source}: {error}", file=sys.stderr)
+        return 2
     if args.update:
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
         args.baseline.write_text(json.dumps({"stages": run["stages"]}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
@@ -107,8 +124,8 @@ def main(argv=None):
     except (json.JSONDecodeError, OSError) as e:
         print(f"error: failed to read baseline '{args.baseline}': {e}", file=sys.stderr)
         return 2
-    if not isinstance(baseline, dict) or "stages" not in baseline or not isinstance(baseline["stages"], dict):
-        print(f"error: invalid baseline '{args.baseline}': missing 'stages' mapping", file=sys.stderr)
+    if error := report_error(baseline):
+        print(f"error: invalid baseline '{args.baseline}': {error}", file=sys.stderr)
         return 2
     bad, notes = compare(baseline, run)
     for n in notes:

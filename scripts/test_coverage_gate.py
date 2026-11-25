@@ -148,6 +148,38 @@ class CliGateTests(unittest.TestCase):
             content = json.loads(new_base.read_text(encoding="utf-8"))
             self.assertEqual(content, {"stages": STAGES})
 
+    def test_empty_or_incomplete_update_keeps_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            baseline = Path(tmp) / "baseline.json"
+            original = json.dumps(run()).encode("utf-8")
+            baseline.write_bytes(original)
+            reports = (
+                {"stages": {}},
+                {"stages": {"CS": {"translated": 1}}},
+                run(CS={"total": 0, "translated": 0, "unsupported": 0}, PS={"total": 0, "translated": 0}),
+            )
+            for report in reports:
+                with self.subTest(report=report):
+                    run_file.write_text(json.dumps(report), encoding="utf-8")
+                    ret = main(["--run-json", str(run_file), "--baseline", str(baseline), "--update"])
+                    self.assertEqual(ret, 2)
+                    self.assertEqual(baseline.read_bytes(), original)
+
+    def test_bad_counter_on_either_side_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            baseline = Path(tmp) / "baseline.json"
+            good = run()
+            for counter in (None, True, -1, "0"):
+                bad = run(CS={"validator_failed": counter})
+                for current, reference in ((bad, good), (good, bad)):
+                    with self.subTest(counter=counter, report_is_bad=current is bad):
+                        run_file.write_text(json.dumps(current), encoding="utf-8")
+                        baseline.write_text(json.dumps(reference), encoding="utf-8")
+                        ret = main(["--run-json", str(run_file), "--baseline", str(baseline)])
+                        self.assertEqual(ret, 2)
+
     def test_pass_exit_code_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_file = Path(tmp) / "run.json"
